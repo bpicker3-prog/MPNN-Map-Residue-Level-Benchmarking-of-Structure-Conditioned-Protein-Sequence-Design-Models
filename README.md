@@ -1,0 +1,2 @@
+# MPNN-Map-Residue-Level-Benchmarking-of-Structure-Conditioned-Protein-Sequence-Design-Models
+MPNN-Map is a residue-level benchmarking tool for structure-conditioned protein sequence design. It compares ProteinMPNN, LigandMPNN, and SolubleMPNN across user-provided protein backbones and generates amino-acid transition matrices, residue-retention metrics, physicochemical-class analysis, and heatmaps.
