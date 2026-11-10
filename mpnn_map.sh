@@ -271,6 +271,8 @@ PY
 
 mkdir -p "$OUT_BASE/inputs" "$OUT_BASE/runs" "$OUT_BASE/profiles" "$OUT_BASE/summary"
 OUT_BASE="$(cd "$OUT_BASE" && pwd)"
+FAIL_LOG="$OUT_BASE/summary/failed_inputs.tsv"
+printf 'input\tprotein\tstage\tmodel\treason\tdetail\n' > "$FAIL_LOG"
 
 normalize_model() {
   case "$1" in
@@ -319,6 +321,33 @@ PY
   printf '%s\n' "$out"
 }
 
+validate_backbone() {
+  local pdb="$1"
+  "$ANALYSIS_PYTHON_BIN" - "$pdb" <<'PYVALID'
+import sys
+from Bio.PDB import PDBParser
+pdb=sys.argv[1]
+aa={'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE','LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL'}
+required={'N','CA','C','O'}
+s=PDBParser(QUIET=True).get_structure('x',pdb)
+model=next(s.get_models())
+problems=[]
+for chain in model:
+    for r in chain:
+        if r.resname.strip() not in aa:
+            continue
+        names={a.get_name().strip() for a in r.get_atoms()}
+        missing=sorted(required-names)
+        if missing:
+            problems.append((chain.id,r.id[1],r.resname.strip(),','.join(missing)))
+if problems:
+    for chain,resnum,resname,missing in problems:
+        print(f'{chain}{resnum}:{resname}:missing={missing}')
+    raise SystemExit(10)
+print('OK')
+PYVALID
+}
+
 make_reference() {
   local pdb="$1" outdir="$2"
   mkdir -p "$outdir/seqs"
@@ -354,7 +383,7 @@ run_model() {
   local start end elapsed
   start=$(date +%s)
   echo "[MPNN] $protein :: $tag ($NUM_SEQS designs, T=$TEMPERATURE)"
-  ( cd "$LIGANDMPNN_PATH" && "$MPNN_PYTHON_BIN" run.py \
+( cd "$LIGANDMPNN_PATH" && "$MPNN_PYTHON_BIN" run.py \
     --pdb_path "$final/ref_clean.pdb" \
     --out_folder "$tmp" \
     --batch_size "$NUM_SEQS" \
@@ -503,15 +532,61 @@ printf 'input\tprepared_pdb\tprotein\n' > "$OUT_BASE/summary/input_manifest.tsv"
 idx=0
 for input in "${INPUTS[@]}"; do
   idx=$((idx+1))
-  prepared="$(prepare_pdb "$input" "$idx" | tail -n 1)"
+  prep_tmp="$OUT_BASE/summary/.prepare_${idx}.log"
+  if ! prepare_pdb "$input" "$idx" >"$prep_tmp" 2>&1; then
+    detail="$(tr '\n\t' '  ' < "$prep_tmp" | sed 's/[[:space:]]\+/ /g')"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "" "prepare" "" "preparation_failed" "$detail" >> "$FAIL_LOG"
+    echo "[WARNING] skipping $input: preparation failed" >&2
+    rm -f "$prep_tmp"
+    continue
+  fi
+  prepared="$(tail -n 1 "$prep_tmp")"
+  rm -f "$prep_tmp"
   protein="$(basename "$prepared" .pdb)"
   printf '%s\t%s\t%s\n' "$input" "$prepared" "$protein" >> "$OUT_BASE/summary/input_manifest.tsv"
+
+  validation="$OUT_BASE/summary/.validate_${idx}.log"
+  if ! validate_backbone "$prepared" >"$validation" 2>&1; then
+    detail="$(tr '\n\t' '; ' < "$validation" | sed 's/[[:space:]]\+/ /g')"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "validation" "" "incomplete_backbone" "$detail" >> "$FAIL_LOG"
+    echo "[WARNING] skipping $protein: incomplete N/CA/C/O backbone ($detail)" >&2
+    rm -f "$validation"
+    continue
+  fi
+  rm -f "$validation"
+
+  completed=0
   for m in $MODELS; do
     read -r model_type tag <<< "$(normalize_model "$m")"
     [[ "$model_type" != ERROR ]] || { echo "ERROR: model must be protein, ligand, or soluble: $m" >&2; exit 2; }
-    run_model "$prepared" "$protein" "$model_type" "$tag"
+    model_log="$OUT_BASE/summary/.model_${idx}_${tag}.log"
+    set +e
+    run_model "$prepared" "$protein" "$model_type" "$tag" > >(tee "$model_log") 2>&1
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      completed=$((completed+1))
+      rm -f "$model_log"
+    else
+      detail="$(tail -n 20 "$model_log" | tr '\n\t' '  ' | sed 's/[[:space:]]\+/ /g')"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "model" "$tag" "model_failed_exit_${rc}" "$detail" >> "$FAIL_LOG"
+      echo "[WARNING] $protein/$tag failed (exit $rc); continuing benchmark" >&2
+      rm -f "$model_log"
+    fi
   done
-  "$ANALYSIS_PYTHON_BIN" "$PROFILE_PY" "$OUT_BASE/runs" "$protein" "$OUT_BASE/profiles/$protein"
+
+  if (( completed > 0 )); then
+    set +e
+    "$ANALYSIS_PYTHON_BIN" "$PROFILE_PY" "$OUT_BASE/runs" "$protein" "$OUT_BASE/profiles/$protein"
+    prc=$?
+    set -e
+    if [[ $prc -ne 0 ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "profile" "" "profile_failed" "profile generation exit $prc" >> "$FAIL_LOG"
+      echo "[WARNING] profile generation failed for $protein; continuing" >&2
+    fi
+  else
+    echo "[WARNING] no models completed for $protein; no profile generated" >&2
+  fi
 done
 
 "$ANALYSIS_PYTHON_BIN" "$SUMMARY_PY" "$OUT_BASE/runs" "$OUT_BASE/summary"
@@ -523,6 +598,7 @@ echo "Results: $OUT_BASE"
 echo "  Mutation maps: $OUT_BASE/profiles/<protein>/<model>/"
 echo "  Per-protein metrics: $OUT_BASE/summary/per_protein_summary.csv"
 echo "  Statistical tests: $OUT_BASE/summary/statistical_tests.csv"
+echo "  Failed/skipped inputs: $FAIL_LOG"
 
 __MPNN_ENGINE__
 chmod +x "$ENGINE"
@@ -638,4 +714,5 @@ printf "  %-24s %b%s%b\n" "Run metadata:" "$CYAN" "$OUT_BASE/summary/run_metadat
 printf "  %-24s %b%s%b\n" "Run reproducibility:" "$CYAN" "$OUT_BASE/summary/across_run_summary.csv" "$RESET"
 printf "  %-24s %b%s%b\n" "Run-level tests:" "$CYAN" "$OUT_BASE/summary/run_level_statistical_tests.csv" "$RESET"
 printf "  %-24s %b%s%b\n" "Across-protein tests:" "$CYAN" "$OUT_BASE/summary/primary_across_protein_tests.csv" "$RESET"
+printf "  %-24s %b%s%b\n" "Failures by replicate:" "$CYAN" "$OUT_BASE/replicates/run_XXX/summary/failed_inputs.tsv" "$RESET"
 printf "\n%bTip:%b set NO_COLOR=1 to disable terminal colors.\n" "$YELLOW" "$RESET"
