@@ -355,12 +355,13 @@ run_model() {
   start=$(date +%s)
   echo "[MPNN] $protein :: $tag ($NUM_SEQS designs, T=$TEMPERATURE)"
   ( cd "$LIGANDMPNN_PATH" && "$MPNN_PYTHON_BIN" run.py \
-      --pdb_path "$final/ref_clean.pdb" \
-      --out_folder "$tmp" \
-      --batch_size "$NUM_SEQS" \
-      --temperature "$TEMPERATURE" \
-      --seed "$RANDOM_SEED" \
-      --model_type "$model_type" )
+    --pdb_path "$final/ref_clean.pdb" \
+    --out_folder "$tmp" \
+    --batch_size "$NUM_SEQS" \
+    --temperature "$TEMPERATURE" \
+    --seed "$RANDOM_SEED" \
+    --model_type "$model_type" \
+    --parse_atoms_with_zero_occupancy 1 )
   end=$(date +%s); elapsed=$((end-start))
   local found
   found="$(find "$tmp" -type f \( -name '*.fa' -o -name '*.fasta' -o -name '*.fas' \) -print -quit)"
