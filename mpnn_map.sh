@@ -19,6 +19,8 @@ TEMP=0.1
 MODELS="protein ligand soluble"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME_DIR="${MPNN_BENCHMARK_RUNTIME:-$SCRIPT_DIR/.mpnn_benchmark_runtime}"
+PDB_CACHE_DIR="${MPNN_PDB_CACHE:-$RUNTIME_DIR/pdb_cache}"
+export MPNN_PDB_CACHE="$PDB_CACHE_DIR"
 LIGANDMPNN_PATH="${LIGANDMPNN_PATH:-$RUNTIME_DIR/LigandMPNN}"
 ANALYSIS_PYTHON_BIN="${ANALYSIS_PYTHON_BIN:-$RUNTIME_DIR/benchmark-analysis-python}"
 MPNN_PYTHON_BIN="${MPNN_PYTHON_BIN:-$RUNTIME_DIR/benchmark-mpnn-python}"
@@ -288,11 +290,33 @@ prepare_pdb() {
   local raw stem
   if [[ "$input" =~ ^[0-9A-Za-z]{4}$ ]]; then
     local id="${input^^}" lower="${input,,}"
-    raw="$OUT_BASE/inputs/${lower}_assembly1.cif.gz"
-    echo "[download] $id biological assembly 1" >&2
-    curl -fsSL --max-time 120 -o "$raw" "https://files.wwpdb.org/download/${id}-assembly1.cif.gz"
-    gzip -dc "$raw" > "$OUT_BASE/inputs/${lower}_assembly1.cif"
-    raw="$OUT_BASE/inputs/${lower}_assembly1.cif"
+    local cache_dir="${MPNN_PDB_CACHE:-$OUT_BASE/pdb_cache}"
+    local cache_gz="$cache_dir/${lower}_assembly1.cif.gz"
+    local cache_cif="$cache_dir/${lower}_assembly1.cif"
+    mkdir -p "$cache_dir"
+    if [[ -s "$cache_cif" ]]; then
+      echo "[cache] $id biological assembly 1" >&2
+    else
+      echo "[download] $id biological assembly 1" >&2
+      rm -f "$cache_gz.tmp" "$cache_gz"
+      if ! timeout --signal=TERM --kill-after=10s 150s \
+          curl -fsSL --connect-timeout 20 --max-time 120 \
+          --retry 2 --retry-delay 2 --retry-all-errors \
+          -o "$cache_gz.tmp" "https://files.wwpdb.org/download/${id}-assembly1.cif.gz"; then
+        rm -f "$cache_gz.tmp"
+        echo "ERROR: download failed or timed out for $id" >&2
+        return 6
+      fi
+      mv "$cache_gz.tmp" "$cache_gz"
+      if ! gzip -t "$cache_gz"; then
+        rm -f "$cache_gz"
+        echo "ERROR: invalid gzip downloaded for $id" >&2
+        return 7
+      fi
+      gzip -dc "$cache_gz" > "$cache_cif.tmp"
+      mv "$cache_cif.tmp" "$cache_cif"
+    fi
+    raw="$cache_cif"
     stem="${lower}_assembly1"
   else
     [[ -f "$input" ]] || { echo "ERROR: input not found: $input" >&2; return 3; }
@@ -715,4 +739,5 @@ printf "  %-24s %b%s%b\n" "Run reproducibility:" "$CYAN" "$OUT_BASE/summary/acro
 printf "  %-24s %b%s%b\n" "Run-level tests:" "$CYAN" "$OUT_BASE/summary/run_level_statistical_tests.csv" "$RESET"
 printf "  %-24s %b%s%b\n" "Across-protein tests:" "$CYAN" "$OUT_BASE/summary/primary_across_protein_tests.csv" "$RESET"
 printf "  %-24s %b%s%b\n" "Failures by replicate:" "$CYAN" "$OUT_BASE/replicates/run_XXX/summary/failed_inputs.tsv" "$RESET"
+printf "  %-24s %b%s%b\n" "Shared PDB cache:" "$CYAN" "$PDB_CACHE_DIR" "$RESET"
 printf "\n%bTip:%b set NO_COLOR=1 to disable terminal colors.\n" "$YELLOW" "$RESET"
